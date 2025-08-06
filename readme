@@ -1,0 +1,18 @@
+MergerFS Cross-Drive Deduplicator
+This project provides a Python script designed to find and eliminate duplicate files across multiple physical drives that are part of a mergerfs pool. It automates the process of creating hardlinks for duplicates that exist on different filesystems, something that standard tools cannot do directly.
+
+The Problem
+Standard deduplication tools like jdupes can create hardlinks to save space, but only if the duplicate files reside on the same physical drive (filesystem). When using mergerfs to pool several drives, it's common for identical files to exist on separate disks, preventing traditional hardlinking and wasting significant space.
+
+The Solution
+This script solves the problem by implementing a failsafe "delete-and-link" workflow:
+
+Manifest Creation: It uses the JSON output from jdupes as a manifest of all duplicate files across the pool.
+
+Master File Logic: It designates a "master" copy for each duplicate set (e.g., any file located in a primary /Media directory).
+
+Failsafe Linking: For each duplicate file on a different drive, it safely deletes the duplicate and then creates a hardlink on the master file's drive that points to the master copy.
+
+Stateful Logging: It maintains a CSV log to track the status of every operation (PENDING, DELETED, LINKED), allowing the script to be stopped and safely resumed at any time without data loss.
+
+This allows you to reclaim terabytes of wasted space by consolidating duplicates into a single physical copy with multiple hardlinks, all while being completely transparent to your applications (like Plex or Jellyfin) that access files through the mergerfs mount point.
