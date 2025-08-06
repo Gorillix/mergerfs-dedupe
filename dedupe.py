@@ -27,7 +27,6 @@ def setup_logging():
 def check_dependencies():
     """Checks if required command-line tools are installed."""
     logging.info("--- Checking for required dependencies... ---")
-    # jdupes is the only hard requirement for the script's core logic.
     required_apps = ['jdupes']
     missing_apps = []
     for app in required_apps:
@@ -88,7 +87,6 @@ def get_physical_path(mergerfs_path, pool_root):
     """Resolves the underlying physical path and its disk root from a mergerfs path."""
     try:
         physical_path = os.path.realpath(mergerfs_path)
-        # Check if the real path is within one of the pool disks
         for disk in os.listdir(pool_root):
             disk_path = os.path.join(pool_root, disk)
             if os.path.isdir(disk_path) and physical_path.startswith(disk_path):
@@ -97,7 +95,7 @@ def get_physical_path(mergerfs_path, pool_root):
         logging.warning(f"Could not resolve physical path for {mergerfs_path}: {e}")
     return None, None
 
-def link_file(db_connection, master_physical_path, physical_disk_root, dup_file, primary_path):
+def link_file(db_connection, master_physical_path, physical_disk_root, dup_file, primary_path, stats):
     """Creates directories and the final hardlink."""
     mergerfs_base = Path(primary_path).parent
     relative_dup_dir = Path(dup_file).parent.relative_to(mergerfs_base)
@@ -110,10 +108,13 @@ def link_file(db_connection, master_physical_path, physical_disk_root, dup_file,
     logging.info(f"    - Creating hardlink at: {link_target_path}")
     os.link(master_physical_path, link_target_path)
     update_state_db(db_connection, dup_file, 'LINKED')
+    stats['links_created'] += 1
     logging.info(f"    - SUCCESS! Linked {dup_file}")
 
 def run_deduplication(args):
     """Main function to execute the deduplication process."""
+    stats = {'sets_processed': 0, 'links_created': 0, 'recoveries': 0, 'failures': 0}
+
     if not args.perform_actions:
         logging.warning("--- DRY RUN MODE: No files will be deleted or linked. ---")
 
@@ -121,12 +122,16 @@ def run_deduplication(args):
         with open(args.json_file, 'r') as f:
             data = json.load(f)
         match_sets = data.get('matchSets', [])
+        # --- Manifest Validation ---
+        if not isinstance(match_sets, list) or (match_sets and not all('files' in s and isinstance(s.get('files'), list) for s in match_sets)):
+            logging.error("Invalid manifest format: 'matchSets' should be a list of objects, each with a 'files' list.")
+            sys.exit(1)
     except (FileNotFoundError, json.JSONDecodeError) as e:
         logging.error(f"Could not read or parse manifest {args.json_file}: {e}")
         sys.exit(1)
 
     processed_files = load_processed_files(args.db_file)
-    file_to_set_map = {f['filePath']: s for s in match_sets for f in s['files']}
+    file_to_set_map = {f['filePath']: s for s in match_sets for f in s.get('files', [])}
     
     logging.info(f"Loaded {len(processed_files)} entries from the state database.")
 
@@ -143,6 +148,7 @@ def run_deduplication(args):
                 logging.info(f"Attempting to recover failed link for: {dup_file}")
                 if dup_file not in file_to_set_map:
                     logging.error(f"  - Could not find {dup_file} in the manifest. Cannot recover.")
+                    stats['failures'] += 1
                     continue
                 
                 match_set = file_to_set_map[dup_file]
@@ -150,20 +156,24 @@ def run_deduplication(args):
 
                 if not master_file:
                     logging.error(f"  - Could not find a master file for {dup_file}. Cannot recover.")
+                    stats['failures'] += 1
                     continue
 
                 master_physical_path, physical_disk_root = get_physical_path(master_file, args.pool_root)
                 if not master_physical_path:
                     logging.error(f"  - FATAL: Could not determine physical path for master {master_file}. Cannot recover.")
+                    stats['failures'] += 1
                     continue
                 
                 try:
                     if args.perform_actions:
-                        link_file(db_connection, master_physical_path, physical_disk_root, dup_file, args.primary_path)
+                        link_file(db_connection, master_physical_path, physical_disk_root, dup_file, args.primary_path, stats)
+                        stats['recoveries'] += 1
                     else:
                         logging.info(f"  - [Dry Run] Would recover link for {dup_file}")
                 except Exception as e:
                     logging.error(f"  - FAILED to recover link for {dup_file}. Error: {e}")
+                    stats['failures'] += 1
 
         # --- REFRESH the dictionary after potential recovery actions ---
         logging.info("Refreshing file status after recovery check...")
@@ -172,21 +182,22 @@ def run_deduplication(args):
         # --- Main Processing Loop ---
         logging.info(f"--- Starting to process {len(match_sets)} duplicate sets... ---")
         for match_set in match_sets:
-            files = [f['filePath'] for f in match_set['files']]
+            files = [f['filePath'] for f in match_set.get('files', [])]
             master_file = next((f for f in files if f.startswith(args.primary_path)), None)
             
             if not master_file:
                 continue
 
+            stats['sets_processed'] += 1
             logging.info(f"Processing set for master: {master_file}")
             
             master_physical_path, physical_disk_root = get_physical_path(master_file, args.pool_root)
             if not master_physical_path:
                 logging.error(f"    - FATAL: Could not determine physical path for master {master_file}. Skipping set.")
+                stats['failures'] += 1
                 continue
 
             for dup_file in files:
-                # This is the correct, per-file check. It is fast and reliable.
                 if dup_file == master_file or processed_files.get(dup_file) == 'LINKED':
                     continue
 
@@ -200,15 +211,17 @@ def run_deduplication(args):
                         os.remove(dup_file)
                         update_state_db(db_connection, dup_file, 'DELETED')
 
-                        link_file(db_connection, master_physical_path, physical_disk_root, dup_file, args.primary_path)
+                        link_file(db_connection, master_physical_path, physical_disk_root, dup_file, args.primary_path, stats)
                     except FileNotFoundError:
                          logging.warning(f"    - File not found for deletion (already gone?): {dup_file}. Attempting to link.")
                          try:
-                             link_file(db_connection, master_physical_path, physical_disk_root, dup_file, args.primary_path)
+                             link_file(db_connection, master_physical_path, physical_disk_root, dup_file, args.primary_path, stats)
                          except Exception as e:
                              logging.error(f"    - FAILED to process {dup_file} after FileNotFoundError. Error: {e}")
+                             stats['failures'] += 1
                     except Exception as e:
                         logging.error(f"    - FAILED to process {dup_file}. Error: {e}")
+                        stats['failures'] += 1
                 else:
                     logging.info(f"    - Would delete: {dup_file}")
                     logging.info(f"    - Would create hardlink from '{master_physical_path}'")
@@ -217,7 +230,13 @@ def run_deduplication(args):
             db_connection.close()
             logging.info("--- Database connection closed. ---")
 
+    logging.info("--- Summary Report ---")
+    logging.info(f"  - Total Sets Examined: {stats['sets_processed']}")
+    logging.info(f"  - Hardlinks Created: {stats['links_created']}")
+    logging.info(f"  - Operations Recovered: {stats['recoveries']}")
+    logging.info(f"  - Failures Logged: {stats['failures']}")
     logging.info("--- Deduplication script finished. ---")
+
 
 if __name__ == "__main__":
     setup_logging()
