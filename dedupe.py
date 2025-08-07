@@ -5,6 +5,7 @@ import logging
 import sqlite3
 import argparse
 import shutil
+import subprocess
 from pathlib import Path
 
 def setup_logging():
@@ -83,16 +84,30 @@ def update_state_db(db_connection, filepath, status):
     except sqlite3.Error as e:
         logging.error(f"Could not write to state database: {e}")
 
-def get_physical_path(mergerfs_path, pool_root):
-    """Resolves the underlying physical path and its disk root from a mergerfs path."""
+def get_physical_path(mergerfs_path, pool_root, primary_path):
+    """
+    Resolves the underlying physical path by checking for the file's existence on each physical disk.
+    This is the most direct and reliable fallback method.
+    """
     try:
-        physical_path = os.path.realpath(mergerfs_path)
+        # Determine the base of the mergerfs mount to create a relative path
+        # e.g., if primary_path is /mnt/storage/Media, the base is /mnt/storage
+        mergerfs_base = str(Path(primary_path).parent)
+        relative_path = os.path.relpath(mergerfs_path, mergerfs_base)
+
+        # Loop through each physical disk and check if the path exists
         for disk in os.listdir(pool_root):
             disk_path = os.path.join(pool_root, disk)
-            if os.path.isdir(disk_path) and physical_path.startswith(disk_path):
-                return physical_path, disk_path
-    except (FileNotFoundError, OSError) as e:
+            if not os.path.isdir(disk_path):
+                continue
+            
+            physical_path_to_check = os.path.join(disk_path, relative_path)
+            if os.path.exists(physical_path_to_check):
+                return physical_path_to_check, disk_path
+                
+    except (FileNotFoundError, OSError, ValueError) as e:
         logging.warning(f"Could not resolve physical path for {mergerfs_path}: {e}")
+    
     return None, None
 
 def link_file(db_connection, master_physical_path, physical_disk_root, dup_file, primary_path, stats):
@@ -122,16 +137,15 @@ def run_deduplication(args):
         with open(args.json_file, 'r') as f:
             data = json.load(f)
         match_sets = data.get('matchSets', [])
-        # --- Manifest Validation ---
-        if not isinstance(match_sets, list) or (match_sets and not all('files' in s and isinstance(s.get('files'), list) for s in match_sets)):
-            logging.error("Invalid manifest format: 'matchSets' should be a list of objects, each with a 'files' list.")
+        if not isinstance(match_sets, list) or (match_sets and not all('fileList' in s and isinstance(s.get('fileList'), list) for s in match_sets)):
+            logging.error("Invalid manifest format: 'matchSets' should be a list of objects, each with a 'fileList' list.")
             sys.exit(1)
     except (FileNotFoundError, json.JSONDecodeError) as e:
         logging.error(f"Could not read or parse manifest {args.json_file}: {e}")
         sys.exit(1)
 
     processed_files = load_processed_files(args.db_file)
-    file_to_set_map = {f['filePath']: s for s in match_sets for f in s.get('files', [])}
+    file_to_set_map = {f['filePath']: s for s in match_sets for f in s.get('fileList', [])}
     
     logging.info(f"Loaded {len(processed_files)} entries from the state database.")
 
@@ -152,14 +166,14 @@ def run_deduplication(args):
                     continue
                 
                 match_set = file_to_set_map[dup_file]
-                master_file = next((f['filePath'] for f in match_set['files'] if f.startswith(args.primary_path)), None)
+                master_file = next((f['filePath'] for f in match_set['fileList'] if f.startswith(args.primary_path)), None)
 
                 if not master_file:
                     logging.error(f"  - Could not find a master file for {dup_file}. Cannot recover.")
                     stats['failures'] += 1
                     continue
 
-                master_physical_path, physical_disk_root = get_physical_path(master_file, args.pool_root)
+                master_physical_path, physical_disk_root = get_physical_path(master_file, args.pool_root, args.primary_path)
                 if not master_physical_path:
                     logging.error(f"  - FATAL: Could not determine physical path for master {master_file}. Cannot recover.")
                     stats['failures'] += 1
@@ -175,14 +189,13 @@ def run_deduplication(args):
                     logging.error(f"  - FAILED to recover link for {dup_file}. Error: {e}")
                     stats['failures'] += 1
 
-        # --- REFRESH the dictionary after potential recovery actions ---
         logging.info("Refreshing file status after recovery check...")
         processed_files = load_processed_files(args.db_file)
 
         # --- Main Processing Loop ---
         logging.info(f"--- Starting to process {len(match_sets)} duplicate sets... ---")
         for match_set in match_sets:
-            files = [f['filePath'] for f in match_set.get('files', [])]
+            files = [f['filePath'] for f in match_set.get('fileList', [])]
             master_file = next((f for f in files if f.startswith(args.primary_path)), None)
             
             if not master_file:
@@ -191,7 +204,7 @@ def run_deduplication(args):
             stats['sets_processed'] += 1
             logging.info(f"Processing set for master: {master_file}")
             
-            master_physical_path, physical_disk_root = get_physical_path(master_file, args.pool_root)
+            master_physical_path, physical_disk_root = get_physical_path(master_file, args.pool_root, args.primary_path)
             if not master_physical_path:
                 logging.error(f"    - FATAL: Could not determine physical path for master {master_file}. Skipping set.")
                 stats['failures'] += 1
